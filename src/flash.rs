@@ -1,0 +1,323 @@
+use crate::cigar::cigar_to_segment;
+use crate::config::Config;
+use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
+use crate::segment::{Segment, Statistics};
+use noodles::sam::alignment::RecordBuf;
+
+#[derive(Debug, Clone)]
+pub struct PairOutput {
+    pub read_id: String,
+    pub chr1: String,
+    pub pos1: usize,
+    pub chr2: String,
+    pub pos2: usize,
+    pub strand1: char,
+    pub strand2: char,
+    pub pair_type: String,
+    pub mapq1: u8,
+    pub mapq2: u8,
+}
+
+impl PairOutput {
+    pub fn to_string(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.read_id,
+            self.chr1,
+            self.pos1,
+            self.chr2,
+            self.pos2,
+            self.strand1,
+            self.strand2,
+            self.pair_type,
+            self.mapq1,
+            self.mapq2
+        )
+    }
+}
+
+/// Process flash mode (merged reads)
+/// Port of flash2pairs from flash2pairs.h
+pub fn process_flash(
+    records: &[RecordBuf],
+    config: &Config,
+    stats: &mut Statistics,
+) -> Option<PairOutput> {
+    if records.is_empty() {
+        return None;
+    }
+    
+    if records.len() == 1 {
+        // Single record: intra-read contact
+        process_single_record(&records[0], config, stats)
+    } else if records.len() == 2 {
+        // Two records: chimeric alignment
+        process_two_records(&records[0], &records[1], config, stats)
+    } else {
+        // Too many segments
+        stats.many_hits += 1;
+        None
+    }
+}
+
+fn process_single_record(
+    record: &RecordBuf,
+    config: &Config,
+    stats: &mut Statistics,
+) -> Option<PairOutput> {
+    let read_id = String::from_utf8_lossy(record.name().unwrap()).to_string();
+    let flags = record.flags();
+    let mapq = record.mapping_quality().map(|q| q.get()).unwrap_or(0);
+    
+    // Check if mapped
+    let is_mapped = !flags.is_unmapped()
+        && record.reference_sequence_id().is_some()
+        && !record.cigar().as_ref().is_empty();
+    
+    let chr1 = if is_mapped {
+        String::from_utf8_lossy(
+            record
+                .reference_sequence_id()
+                .and_then(|id| Some(format!("{}", id)))
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .to_string()
+    } else {
+        "!".to_string()
+    };
+    
+    let pos1 = record.alignment_start().map(|p| p.get()).unwrap_or(0);
+    let mut pair_type = if is_mapped { "UU" } else { "NN" };
+    
+    let segment = if is_mapped {
+        match cigar_to_segment(record.cigar(), pos1) {
+            Ok(seg) => seg,
+            Err(_) => {
+                stats.many_hits += 1;
+                return None;
+            }
+        }
+    } else {
+        Segment::new()
+    };
+    
+    if is_mapped && segment.seg_cnt > 2 {
+        stats.many_hits += 1;
+        stats.pair_type_mm += 1;
+        pair_type = "MM";
+    }
+    
+    if is_mapped && !check_integrity_1_seg(&segment, config) {
+        stats.low_map += 1;
+        pair_type = "NN";
+    }
+    
+    let pos2 = if is_mapped && segment.seg_cnt > 0 {
+        segment.right[segment.seg_cnt - 1]
+    } else {
+        pos1
+    };
+    
+    let dist = if pos2 > pos1 { pos2 - pos1 } else { 0 };
+    
+    if is_mapped {
+        if dist >= 10000 {
+            stats.cis10k += 1;
+        } else if dist >= 1000 {
+            stats.cis1k += 1;
+        } else {
+            stats.cis0 += 1;
+        }
+    }
+    
+    stats.sum_mapq += mapq as u64;
+    stats.valid_pairs += 1;
+    
+    match pair_type {
+        "UU" => stats.pair_type_uu += 1,
+        "NN" => stats.pair_type_nn += 1,
+        "MM" => stats.pair_type_mm += 1,
+        _ => {}
+    }
+    
+    Some(PairOutput {
+        read_id,
+        chr1: chr1.clone(),
+        pos1,
+        chr2: chr1,
+        pos2,
+        strand1: '+',
+        strand2: '-',
+        pair_type: pair_type.to_string(),
+        mapq1: mapq,
+        mapq2: mapq,
+    })
+}
+
+fn process_two_records(
+    record1: &RecordBuf,
+    record2: &RecordBuf,
+    config: &Config,
+    stats: &mut Statistics,
+) -> Option<PairOutput> {
+    let read_id = String::from_utf8_lossy(record1.name().unwrap()).to_string();
+    
+    // Process first record
+    let flags1 = record1.flags();
+    let mapq1 = record1.mapping_quality().map(|q| q.get()).unwrap_or(0);
+    let is_mapped1 = !flags1.is_unmapped()
+        && record1.reference_sequence_id().is_some()
+        && !record1.cigar().as_ref().is_empty();
+    
+    let chr1 = if is_mapped1 {
+        format!("{}", record1.reference_sequence_id().unwrap())
+    } else {
+        "!".to_string()
+    };
+    
+    let mut pos1 = record1.alignment_start().map(|p| p.get()).unwrap_or(0);
+    let strand1 = if flags1.is_reverse_complemented() { '-' } else { '+' };
+    
+    let seg1 = if is_mapped1 {
+        match cigar_to_segment(record1.cigar(), pos1) {
+            Ok(seg) => seg,
+            Err(_) => Segment::new(),
+        }
+    } else {
+        Segment::new()
+    };
+    
+    // Process second record
+    let flags2 = record2.flags();
+    let mapq2 = record2.mapping_quality().map(|q| q.get()).unwrap_or(0);
+    let is_mapped2 = !flags2.is_unmapped()
+        && record2.reference_sequence_id().is_some()
+        && !record2.cigar().as_ref().is_empty();
+    
+    let chr2 = if is_mapped2 {
+        format!("{}", record2.reference_sequence_id().unwrap())
+    } else {
+        "!".to_string()
+    };
+    
+    let mut pos2 = record2.alignment_start().map(|p| p.get()).unwrap_or(0);
+    let strand2 = if flags2.is_reverse_complemented() { '-' } else { '+' };
+    
+    let seg2 = if is_mapped2 {
+        match cigar_to_segment(record2.cigar(), pos2) {
+            Ok(seg) => seg,
+            Err(_) => Segment::new(),
+        }
+    } else {
+        Segment::new()
+    };
+    
+    // Determine pair type
+    let q1_good = is_mapped1 && mapq1 >= config.min_mapq;
+    let q2_good = is_mapped2 && mapq2 >= config.min_mapq;
+    
+    let mut pair_type = if !q1_good && !q2_good {
+        "NN"
+    } else if !q1_good || !q2_good {
+        "NU"
+    } else {
+        "UU"
+    };
+    
+    if is_mapped1 && is_mapped2 && (seg1.seg_cnt != 1 || seg2.seg_cnt != 1) {
+        stats.many_hits += 1;
+        pair_type = "MM";
+        stats.pair_type_mm += 1;
+    }
+    
+    if is_mapped1 && is_mapped2 && !check_integrity_2_seg(&seg1, &seg2, config) {
+        stats.low_map += 1;
+        pair_type = "NN";
+    }
+    
+    let pair_mapq = mapq1.min(mapq2);
+    stats.sum_mapq += pair_mapq as u64;
+    stats.valid_pairs += 1;
+    
+    // Get outmost positions
+    if seg1.left_clip > seg1.right_clip && seg1.right.len() > 0 {
+        pos1 = seg1.right[0];
+    }
+    if seg2.left_clip > seg2.right_clip && seg2.right.len() > 0 {
+        pos2 = seg2.right[0];
+    }
+    
+    // Determine order and calculate distance
+    let (final_chr1, final_pos1, final_strand1, final_chr2, final_pos2, final_strand2, final_mapq1, final_mapq2) =
+        if chr1 < chr2 || (chr1 == chr2 && pos1 < pos2) {
+            if chr1 == chr2 {
+                let dist = if pos2 > pos1 { pos2 - pos1 } else { 0 };
+                if dist <= config.max_self_circle_dist {
+                    stats.self_circle += 1;
+                    pair_type = "SC";
+                    stats.pair_type_sc += 1;
+                } else {
+                    if dist >= 10000 {
+                        stats.cis10k += 1;
+                    } else if dist >= 1000 {
+                        stats.cis1k += 1;
+                    } else {
+                        stats.cis0 += 1;
+                    }
+                }
+            } else {
+                stats.trans += 1;
+            }
+            (chr1, pos1, strand1, chr2, pos2, strand2, mapq1, mapq2)
+        } else {
+            if chr1 == chr2 {
+                let dist = if pos1 > pos2 { pos1 - pos2 } else { 0 };
+                if dist <= config.max_self_circle_dist {
+                    stats.self_circle += 1;
+                    pair_type = "SC";
+                    stats.pair_type_sc += 1;
+                } else {
+                    if dist >= 10000 {
+                        stats.cis10k += 1;
+                    } else if dist >= 1000 {
+                        stats.cis1k += 1;
+                    } else {
+                        stats.cis0 += 1;
+                    }
+                }
+            } else {
+                stats.trans += 1;
+            }
+            (chr2, pos2, strand2, chr1, pos1, strand1, mapq2, mapq1)
+        };
+    
+    // Update pair type counters
+    match pair_type {
+        "UU" => stats.pair_type_uu += 1,
+        "NU" => stats.pair_type_nu += 1,
+        "NN" => stats.pair_type_nn += 1,
+        "MM" => {}, // Already counted
+        "UR" => stats.pair_type_ur += 1,
+        "SC" => {}, // Already counted
+        _ => {}
+    }
+    
+    // Skip self-circles
+    if pair_type == "SC" {
+        return None;
+    }
+    
+    Some(PairOutput {
+        read_id,
+        chr1: final_chr1,
+        pos1: final_pos1,
+        chr2: final_chr2,
+        pos2: final_pos2,
+        strand1: final_strand1,
+        strand2: final_strand2,
+        pair_type: pair_type.to_string(),
+        mapq1: final_mapq1,
+        mapq2: final_mapq2,
+    })
+}
