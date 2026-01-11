@@ -2,6 +2,8 @@ use crate::cigar::cigar_to_segment;
 use crate::config::Config;
 use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
 use crate::segment::{Segment, Statistics};
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::RecordBuf;
 
 #[derive(Debug, Clone)]
@@ -16,11 +18,18 @@ pub struct PairOutput {
     pub pair_type: String,
     pub mapq1: u8,
     pub mapq2: u8,
+    // Optional extended fields
+    pub rg: Option<String>,
+    pub start1: usize,
+    pub end1: usize,
+    pub start2: usize,
+    pub end2: usize,
+    pub extra_tag: Option<String>,
 }
 
 impl PairOutput {
-    pub fn to_string(&self) -> String {
-        format!(
+    pub fn to_string(&self, show_read_coords: bool, _extra_tag_name: Option<&str>) -> String {
+        let basic = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.read_id,
             self.chr1,
@@ -32,8 +41,70 @@ impl PairOutput {
             self.pair_type,
             self.mapq1,
             self.mapq2
-        )
+        );
+
+        let mut result = basic;
+        
+        if show_read_coords {
+            result = format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                result,
+                self.rg.as_deref().unwrap_or("."),
+                self.start1,
+                self.end1,
+                self.start2,
+                self.end2
+            );
+        }
+        
+        if let Some(tag_val) = &self.extra_tag {
+            result = format!("{}\t{}", result, tag_val);
+        }
+        
+        result
     }
+}
+
+/// Helper to extract Read Group (RG) tag
+fn get_rg(record: &RecordBuf) -> Option<String> {
+    record
+        .data()
+        .get(&Tag::READ_GROUP)
+        .and_then(|val| {
+            match val {
+                Value::String(s) => Some(s.to_string()),
+                _ => None,
+            }
+        })
+}
+
+/// Helper to extract a specific tag from a record
+fn get_tag_value(record: &RecordBuf, tag_str: &Option<String>) -> Option<String> {
+    let tag_name = tag_str.as_ref()?;
+    let bytes = tag_name.as_bytes();
+    
+    // Safety check for tag length
+    if bytes.len() != 2 {
+        return None;
+    }
+    
+    let tag = Tag::new(bytes[0], bytes[1]);
+
+    // .get() returns Option<&Value>
+    // Match on Value enum variants to extract the actual value
+    record.data().get(&tag).and_then(|val| {
+        match val {
+            Value::String(s) => Some(s.to_string()),
+            Value::Int8(i) => Some(i.to_string()),
+            Value::UInt8(u) => Some(u.to_string()),
+            Value::Int16(i) => Some(i.to_string()),
+            Value::UInt16(u) => Some(u.to_string()),
+            Value::Int32(i) => Some(i.to_string()),
+            Value::UInt32(u) => Some(u.to_string()),
+            Value::Float(f) => Some(f.to_string()),
+            _ => Some(".".to_string()),
+        }
+    })
 }
 
 /// Process flash mode (merged reads)
@@ -141,6 +212,12 @@ fn process_single_record(
         _ => {}
     }
     
+    let rg = get_rg(record);
+    let (start1, end1) = segment.span();
+    // Since it's a single read, both "sides" have the same read span
+    let (start2, end2) = (start1, end1);
+    let extra_tag = get_tag_value(record, &config.extract_tag);
+    
     Some(PairOutput {
         read_id,
         chr1: chr1.clone(),
@@ -152,6 +229,12 @@ fn process_single_record(
         pair_type: pair_type.to_string(),
         mapq1: mapq,
         mapq2: mapq,
+        rg,
+        start1,
+        end1,
+        start2,
+        end2,
+        extra_tag,
     })
 }
 
@@ -248,8 +331,13 @@ fn process_two_records(
         pos2 = seg2.right[0];
     }
     
+    let rg = get_rg(record1);
+    let (start1, end1) = seg1.span();
+    let (start2, end2) = seg2.span();
+    let extra_tag = get_tag_value(record1, &config.extract_tag);
+    
     // Determine order and calculate distance
-    let (final_chr1, final_pos1, final_strand1, final_chr2, final_pos2, final_strand2, final_mapq1, final_mapq2) =
+    let (final_chr1, final_pos1, final_strand1, final_start1, final_end1, final_chr2, final_pos2, final_strand2, final_start2, final_end2, final_mapq1, final_mapq2) =
         if chr1 < chr2 || (chr1 == chr2 && pos1 < pos2) {
             if chr1 == chr2 {
                 let dist = if pos2 > pos1 { pos2 - pos1 } else { 0 };
@@ -269,7 +357,7 @@ fn process_two_records(
             } else {
                 stats.trans += 1;
             }
-            (chr1, pos1, strand1, chr2, pos2, strand2, mapq1, mapq2)
+            (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, mapq1, mapq2)
         } else {
             if chr1 == chr2 {
                 let dist = if pos1 > pos2 { pos1 - pos2 } else { 0 };
@@ -289,7 +377,7 @@ fn process_two_records(
             } else {
                 stats.trans += 1;
             }
-            (chr2, pos2, strand2, chr1, pos1, strand1, mapq2, mapq1)
+            (chr2, pos2, strand2, start2, end2, chr1, pos1, strand1, start1, end1, mapq2, mapq1)
         };
     
     // Update pair type counters
@@ -319,5 +407,11 @@ fn process_two_records(
         pair_type: pair_type.to_string(),
         mapq1: final_mapq1,
         mapq2: final_mapq2,
+        rg,
+        start1: final_start1,
+        end1: final_end1,
+        start2: final_start2,
+        end2: final_end2,
+        extra_tag,
     })
 }

@@ -20,6 +20,15 @@ impl Segment {
             mappable: 0,
         }
     }
+
+    /// Get the genomic span (start, end) of the segment
+    pub fn span(&self) -> (usize, usize) {
+        if self.seg_cnt == 0 || self.left.is_empty() {
+            (0, 0)
+        } else {
+            (self.left[0], self.right[self.seg_cnt - 1])
+        }
+    }
 }
 
 impl Default for Segment {

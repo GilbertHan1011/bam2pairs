@@ -3,6 +3,8 @@ use crate::config::Config;
 use crate::flash::PairOutput;
 use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
 use crate::segment::{Segment, SegKey, Statistics};
+use noodles::sam::alignment::record::data::field::Tag;
+use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::RecordBuf;
 
 /// Process unc mode (unmerged paired-end reads)
@@ -31,13 +33,40 @@ pub fn process_unc(
         }
     }
     
+    // Extract RG tag from first R1 record, or first R2 if R1 is empty
+    let rg = if !r1_records.is_empty() {
+        r1_records[0].data().get(&Tag::READ_GROUP).and_then(|v| {
+            match v {
+                Value::String(s) => Some(s.to_string()),
+                _ => None,
+            }
+        })
+    } else if !r2_records.is_empty() {
+        r2_records[0].data().get(&Tag::READ_GROUP).and_then(|v| {
+            match v {
+                Value::String(s) => Some(s.to_string()),
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+    
+    // Extract extra tag (try first record of R1 as representative)
+    let mut extra_tag = None;
+    if !r1_records.is_empty() {
+        extra_tag = get_tag_value(r1_records[0], &config.extract_tag);
+    } else if !r2_records.is_empty() {
+        extra_tag = get_tag_value(r2_records[0], &config.extract_tag);
+    }
+    
     // Check if we have both R1 and R2
     if r1_records.is_empty() || r2_records.is_empty() {
         stats.pair_type_nn += 1;
         // Create fallback using first available records
         let r1_segkeys: Vec<SegKey> = r1_records.iter().map(|r| record_to_segkey(r)).collect();
         let r2_segkeys: Vec<SegKey> = r2_records.iter().map(|r| record_to_segkey(r)).collect();
-        return create_fallback_pair(&read_id, &r1_segkeys, &r2_segkeys);
+        return create_fallback_pair(&read_id, &r1_segkeys, &r2_segkeys, rg, extra_tag);
     }
     
     if r1_records.len() + r2_records.len() > 3 {
@@ -168,7 +197,7 @@ pub fn process_unc(
         _ => return None,
     };
     
-    let (chr1, pos1, strand1, chr2, pos2, strand2, q1, q2) = match result {
+    let (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2) = match result {
         Some(r) => r,
         None => return None,
     };
@@ -189,8 +218,14 @@ pub fn process_unc(
         _ => {}
     }
     
+    // Extract RG tag from R1 records (already extracted above)
+    // Extract extra tag if not already done
+    if extra_tag.is_none() {
+        extra_tag = get_tag_value(r1_records[0], &config.extract_tag);
+    }
+    
     // Determine final order and calculate distance
-    let (final_chr1, final_pos1, final_strand1, final_chr2, final_pos2, final_strand2, final_mapq1, final_mapq2) =
+    let (final_chr1, final_pos1, final_strand1, final_start1, final_end1, final_chr2, final_pos2, final_strand2, final_start2, final_end2, final_mapq1, final_mapq2) =
         if chr1 < chr2 || (chr1 == chr2 && pos1 < pos2) {
             if chr1 == chr2 {
                 let dist = if pos2 > pos1 { pos2 - pos1 } else { 0 };
@@ -209,7 +244,7 @@ pub fn process_unc(
             } else {
                 stats.trans += 1;
             }
-            (chr1, pos1, strand1, chr2, pos2, strand2, q1, q2)
+            (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2)
         } else {
             if chr1 == chr2 {
                 let dist = if pos1 > pos2 { pos1 - pos2 } else { 0 };
@@ -228,7 +263,7 @@ pub fn process_unc(
             } else {
                 stats.trans += 1;
             }
-            (chr2, pos2, strand2, chr1, pos1, strand1, q2, q1)
+            (chr2, pos2, strand2, start2, end2, chr1, pos1, strand1, start1, end1, q2, q1)
         };
     
     Some(PairOutput {
@@ -242,6 +277,12 @@ pub fn process_unc(
         pair_type: pair_type.to_string(),
         mapq1: final_mapq1,
         mapq2: final_mapq2,
+        rg,
+        start1: final_start1,
+        end1: final_end1,
+        start2: final_start2,
+        end2: final_end2,
+        extra_tag,
     })
 }
 
@@ -281,10 +322,41 @@ fn parse_segment_from_record(record: &RecordBuf) -> Segment {
     }
 }
 
+// Helper to extract a specific tag from a record
+fn get_tag_value(record: &RecordBuf, tag_str: &Option<String>) -> Option<String> {
+    let tag_name = tag_str.as_ref()?;
+    let bytes = tag_name.as_bytes();
+    
+    // Safety check for tag length
+    if bytes.len() != 2 {
+        return None;
+    }
+    
+    let tag = Tag::new(bytes[0], bytes[1]);
+
+    // .get() returns Option<&Value>
+    // Match on Value enum variants to extract the actual value
+    record.data().get(&tag).and_then(|val| {
+        match val {
+            Value::String(s) => Some(s.to_string()),
+            Value::Int8(i) => Some(i.to_string()),
+            Value::UInt8(u) => Some(u.to_string()),
+            Value::Int16(i) => Some(i.to_string()),
+            Value::UInt16(u) => Some(u.to_string()),
+            Value::Int32(i) => Some(i.to_string()),
+            Value::UInt32(u) => Some(u.to_string()),
+            Value::Float(f) => Some(f.to_string()),
+            _ => Some(".".to_string()),
+        }
+    })
+}
+
 fn create_fallback_pair(
     read_id: &str,
     r1_segkeys: &[SegKey],
     r2_segkeys: &[SegKey],
+    rg: Option<String>,
+    extra_tag: Option<String>,
 ) -> Option<PairOutput> {
     let (chr1, pos1, strand1, q1) = if !r1_segkeys.is_empty() {
         (
@@ -319,8 +391,17 @@ fn create_fallback_pair(
         pair_type: "NN".to_string(),
         mapq1: q1,
         mapq2: q2,
+        rg,
+        start1: 0,
+        end1: 0,
+        start2: 0,
+        end2: 0,
+        extra_tag,
     })
 }
+
+// Updated return type: (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2)
+type ResolveResult = Option<(String, usize, char, usize, usize, String, usize, char, usize, usize, u8, u8)>;
 
 fn resolve_category_0(
     r1_records: &[&RecordBuf],
@@ -330,7 +411,7 @@ fn resolve_category_0(
     _config: &Config,
     _stats: &mut Statistics,
     _pair_type: &mut &str,
-) -> Option<(String, usize, char, String, usize, char, u8, u8)> {
+) -> ResolveResult {
     let r1_0 = record_to_segkey(r1_records[0]);
     let r2_0 = record_to_segkey(r2_records[0]);
     let strand1 = r1_0.strand;
@@ -358,7 +439,10 @@ fn resolve_category_0(
         r2_0.pos
     };
     
-    Some((chr1, pos1, strand1, chr2, pos2, strand2, r1_0.mapq, r2_0.mapq))
+    let (start1, end1) = s1.span();
+    let (start2, end2) = s2.span();
+    
+    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq))
 }
 
 fn resolve_category_1(
@@ -370,7 +454,7 @@ fn resolve_category_1(
     config: &Config,
     stats: &mut Statistics,
     pair_type: &mut &str,
-) -> Option<(String, usize, char, String, usize, char, u8, u8)> {
+) -> ResolveResult {
     let r1_0 = record_to_segkey(r1_records[0]);
     let r2_0 = record_to_segkey(r2_records[0]);
     let r2_1 = if r2_records.len() > 1 {
@@ -390,6 +474,8 @@ fn resolve_category_1(
     } else {
         r1_0.pos
     };
+    
+    let (start1, end1) = s1.span();
     
     // Try to pair s1 with s2 or s3
     let mate = determine_mate_1_2(&r1_0, &r2_0, &r2_1, s1, s2, s3, config);
@@ -411,11 +497,12 @@ fn resolve_category_1(
         } else {
             r2_0.pos
         };
+        let (start2, end2) = s2.span();
         
-        return Some((chr1, pos1, strand1, chr2, pos2, strand2, r1_0.mapq, r2_0.mapq));
+        return Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq));
     }
     
-    let (chr2, pos2, strand2, q2) = if mate == 2 {
+    let (chr2, pos2, strand2, start2, end2, q2) = if mate == 2 {
         // s1 paired with s2, extract from s3
         let chr = r2_1.chr.clone();
         let strand = r2_1.strand;
@@ -426,7 +513,8 @@ fn resolve_category_1(
         } else {
             r2_1.pos
         };
-        (chr, pos, strand, r2_0.mapq)
+        let (s, e) = s3.span();
+        (chr, pos, strand, s, e, r2_0.mapq)
     } else {
         // mate == 3: s1 paired with s3, extract from s2
         let chr = r2_0.chr.clone();
@@ -438,10 +526,11 @@ fn resolve_category_1(
         } else {
             r2_0.pos
         };
-        (chr, pos, strand, r2_1.mapq)
+        let (s, e) = s2.span();
+        (chr, pos, strand, s, e, r2_1.mapq)
     };
     
-    Some((chr1, pos1, strand1, chr2, pos2, strand2, r1_0.mapq, q2))
+    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, q2))
 }
 
 fn resolve_category_2(
@@ -453,7 +542,7 @@ fn resolve_category_2(
     config: &Config,
     stats: &mut Statistics,
     pair_type: &mut &str,
-) -> Option<(String, usize, char, String, usize, char, u8, u8)> {
+) -> ResolveResult {
     let r1_0 = record_to_segkey(r1_records[0]);
     let r1_1 = if r1_records.len() > 1 {
         record_to_segkey(r1_records[1])
@@ -473,6 +562,8 @@ fn resolve_category_2(
     } else {
         r2_0.pos
     };
+    
+    let (start2, end2) = s3.span();
     
     // Try to pair s3 with s1 or s2
     let mate = determine_mate_2_1(&r1_0, &r1_1, &r2_0, s1, s2, s3, config);
@@ -494,11 +585,12 @@ fn resolve_category_2(
         } else {
             r1_0.pos
         };
+        let (start1, end1) = s1.span();
         
-        return Some((chr1, pos1, strand1, chr2, pos2, strand2, r1_0.mapq, r2_0.mapq));
+        return Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq));
     }
     
-    let (chr1, pos1, strand1, q1) = if mate == 1 {
+    let (chr1, pos1, strand1, start1, end1, q1) = if mate == 1 {
         // s3 paired with s1, extract from s2
         let chr = r1_1.chr.clone();
         let strand = r1_1.strand;
@@ -509,7 +601,8 @@ fn resolve_category_2(
         } else {
             r1_1.pos
         };
-        (chr, pos, strand, r1_0.mapq)
+        let (s, e) = s2.span();
+        (chr, pos, strand, s, e, r1_0.mapq)
     } else {
         // mate == 2: s3 paired with s2, extract from s1
         let chr = r1_0.chr.clone();
@@ -521,10 +614,11 @@ fn resolve_category_2(
         } else {
             r1_0.pos
         };
-        (chr, pos, strand, r1_1.mapq)
+        let (s, e) = s1.span();
+        (chr, pos, strand, s, e, r1_1.mapq)
     };
     
-    Some((chr1, pos1, strand1, chr2, pos2, strand2, q1, r2_0.mapq))
+    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, r2_0.mapq))
 }
 
 fn determine_mate_1_2(

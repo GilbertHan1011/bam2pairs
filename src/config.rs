@@ -6,22 +6,24 @@ pub struct Config {
     pub min_clip_size: usize,
     pub max_self_circle_dist: usize,
     pub max_pair_dist: usize,
+    pub extract_tag: Option<String>,
 }
 
 impl Config {
-    pub fn new(min_mapq: u8, min_mapped_ratio: f32) -> Self {
+    pub fn new(min_mapq: u8, min_mapped_ratio: f32, extract_tag: Option<String>) -> Self {
         Self {
             min_mapq,
             min_mapped_ratio,
             min_clip_size: 20,
             max_self_circle_dist: 10,
             max_pair_dist: 1000,
+            extract_tag,
         }
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self::new(10, 0.5)
+        Self::new(10, 0.5, None)
     }
 }

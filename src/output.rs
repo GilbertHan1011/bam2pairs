@@ -8,19 +8,29 @@ use std::path::Path;
 pub fn write_pairs<P: AsRef<Path>>(
     pairs: &[PairOutput],
     output_path: P,
+    read_coords: bool,
+    extra_tag_name: Option<&str>,
 ) -> Result<(), std::io::Error> {
     let file = File::create(output_path)?;
     let mut writer = BufWriter::new(file);
     
     // Write header
-    writeln!(
-        writer,
-        "#readID\tchr1\tpos1\tchr2\tpos2\tstrand1\tstrand2\tpair_type\tmapq1\tmapq2"
-    )?;
+    let mut header = "#readID\tchr1\tpos1\tchr2\tpos2\tstrand1\tstrand2\tpair_type\tmapq1\tmapq2".to_string();
+    
+    if read_coords {
+        header.push_str("\tRG\tstart1\tend1\tstart2\tend2");
+    }
+    
+    if let Some(tag_name) = extra_tag_name {
+        header.push_str("\t");
+        header.push_str(tag_name);
+    }
+    
+    writeln!(writer, "{}", header)?;
     
     // Write pairs
     for pair in pairs {
-        writeln!(writer, "{}", pair.to_string())?;
+        writeln!(writer, "{}", pair.to_string(read_coords, extra_tag_name))?;
     }
     
     writer.flush()?;

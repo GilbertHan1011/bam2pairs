@@ -48,6 +48,14 @@ struct Args {
     /// Write SAM output
     #[arg(long)]
     write_sam: bool,
+
+    /// Output read start and end coordinates
+    #[arg(long)]
+    read_coords: bool,
+
+    /// Extract specific BAM tag (e.g., RG) to output
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,13 +67,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_global()?;
 
     // Create configuration
-    let config = Config::new(args.min_mapq, args.min_mapped_ratio);
+    let config = Config::new(args.min_mapq, args.min_mapped_ratio, args.tag.clone());
 
     eprintln!("INFO: Reading BAM file: {}", args.input.display());
     eprintln!("INFO: Mode: {}", args.mode);
     eprintln!("INFO: Threads: {}", args.threads);
     eprintln!("INFO: Min MapQ: {}", config.min_mapq);
     eprintln!("INFO: Min mapped ratio: {}", config.min_mapped_ratio);
+    if args.read_coords {
+        eprintln!("INFO: Output read coordinates: enabled");
+    }
+    if let Some(tag) = &config.extract_tag {
+        eprintln!("INFO: Extracting Tag: {}", tag);
+    }
 
     // Open BAM file
     let file = File::open(&args.input)?;
@@ -111,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write output files
     let pairs_file = format!("{}.{}.pairs", args.output.display(), args.mode);
     eprintln!("INFO: Writing pairs to {}", pairs_file);
-    output::write_pairs(&pairs, &pairs_file)?;
+    output::write_pairs(&pairs, &pairs_file, args.read_coords, config.extract_tag.as_deref())?;
 
     let log_file = format!("{}.{}2pairs.log", args.output.display(), args.mode);
     eprintln!("INFO: Writing statistics to {}", log_file);
