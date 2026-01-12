@@ -1,7 +1,9 @@
 mod cigar;
 mod config;
 mod flash;
+mod fragment;
 mod grouper;
+mod hic_classifier;
 mod integrity;
 mod output;
 mod segment;
@@ -12,10 +14,11 @@ use config::Config;
 use grouper::collect_groups;
 use rayon::prelude::*;
 use segment::Statistics;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 #[command(name = "bam2pairs")]
@@ -56,6 +59,22 @@ struct Args {
     /// Extract specific BAM tag (e.g., RG) to output
     #[arg(long)]
     tag: Option<String>,
+
+    /// Restriction fragment BED file for HiC interaction classification
+    #[arg(long)]
+    fragment_bed: Option<PathBuf>,
+
+    /// Minimum fragment size to consider
+    #[arg(long)]
+    min_frag_size: Option<u64>,
+
+    /// Maximum fragment size to consider
+    #[arg(long)]
+    max_frag_size: Option<u64>,
+
+    /// Minimum distance for cis interactions
+    #[arg(long)]
+    min_cis_dist: Option<u64>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,8 +85,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .num_threads(args.threads)
         .build_global()?;
 
+    // Load restriction fragments if provided
+    let fragment_map = if let Some(ref bed_path) = args.fragment_bed {
+        eprintln!("INFO: Loading restriction fragments from: {}", bed_path.display());
+        let map = fragment::FragmentMap::load(
+            bed_path,
+            args.min_frag_size,
+            args.max_frag_size,
+        )?;
+        eprintln!("INFO: Loaded restriction fragments");
+        Some(Arc::new(map))
+    } else {
+        None
+    };
+
+    // Open BAM file
+    let file = File::open(&args.input)?;
+    let reader = BufReader::new(file);
+    let mut bam_reader = noodles::bam::io::Reader::new(reader);
+
+    // Read header
+    let header = bam_reader.read_header()?;
+
+    // Build reference sequence ID to chromosome name mapping
+    let mut ref_seq_map = HashMap::new();
+    for (idx, (name, _)) in header.reference_sequences().iter().enumerate() {
+        if let Ok(name_str) = std::str::from_utf8(name.as_ref()) {
+            ref_seq_map.insert(idx, name_str.to_string());
+        }
+    }
+    let ref_seq_map = Arc::new(ref_seq_map);
+
     // Create configuration
-    let config = Config::new(args.min_mapq, args.min_mapped_ratio, args.tag.clone());
+    let config = Config::new(
+        args.min_mapq,
+        args.min_mapped_ratio,
+        args.tag.clone(),
+        fragment_map,
+        args.min_cis_dist,
+        ref_seq_map,
+    );
 
     eprintln!("INFO: Reading BAM file: {}", args.input.display());
     eprintln!("INFO: Mode: {}", args.mode);
@@ -80,14 +137,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tag) = &config.extract_tag {
         eprintln!("INFO: Extracting Tag: {}", tag);
     }
-
-    // Open BAM file
-    let file = File::open(&args.input)?;
-    let reader = BufReader::new(file);
-    let mut bam_reader = noodles::bam::io::Reader::new(reader);
-
-    // Read header
-    let header = bam_reader.read_header()?;
+    if config.fragment_map.is_some() {
+        eprintln!("INFO: HiC interaction classification: enabled");
+        if let Some(min_dist) = config.min_cis_dist {
+            eprintln!("INFO: Minimum cis distance: {}", min_dist);
+        }
+    }
 
     eprintln!("INFO: Grouping reads by name...");
     let groups = collect_groups(bam_reader, header);
@@ -125,7 +180,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write output files
     let pairs_file = format!("{}.{}.pairs", args.output.display(), args.mode);
     eprintln!("INFO: Writing pairs to {}", pairs_file);
-    output::write_pairs(&pairs, &pairs_file, args.read_coords, config.extract_tag.as_deref())?;
+    output::write_pairs(
+        &pairs,
+        &pairs_file,
+        args.read_coords,
+        config.extract_tag.as_deref(),
+        config.fragment_map.is_some(),
+    )?;
 
     let log_file = format!("{}.{}2pairs.log", args.output.display(), args.mode);
     eprintln!("INFO: Writing statistics to {}", log_file);

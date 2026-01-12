@@ -1,6 +1,7 @@
 use crate::cigar::cigar_to_segment;
 use crate::config::Config;
 use crate::flash::PairOutput;
+use crate::hic_classifier::{classify_interaction, ReadInfo as HicReadInfo};
 use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
 use crate::segment::{Segment, SegKey, Statistics};
 use noodles::sam::alignment::record::data::field::Tag;
@@ -64,8 +65,8 @@ pub fn process_unc(
     if r1_records.is_empty() || r2_records.is_empty() {
         stats.pair_type_nn += 1;
         // Create fallback using first available records
-        let r1_segkeys: Vec<SegKey> = r1_records.iter().map(|r| record_to_segkey(r)).collect();
-        let r2_segkeys: Vec<SegKey> = r2_records.iter().map(|r| record_to_segkey(r)).collect();
+        let r1_segkeys: Vec<SegKey> = r1_records.iter().map(|r| record_to_segkey(r, config)).collect();
+        let r2_segkeys: Vec<SegKey> = r2_records.iter().map(|r| record_to_segkey(r, config)).collect();
         return create_fallback_pair(&read_id, &r1_segkeys, &r2_segkeys, rg, extra_tag);
     }
     
@@ -75,8 +76,8 @@ pub fn process_unc(
     }
     
     // Determine pair type based on MapQ
-    let r1_0 = record_to_segkey(r1_records[0]);
-    let r2_0 = record_to_segkey(r2_records[0]);
+    let r1_0 = record_to_segkey(r1_records[0], config);
+    let r2_0 = record_to_segkey(r2_records[0], config);
     let q1_good = r1_0.is_mapped && r1_0.mapq >= config.min_mapq;
     let q2_good = r2_0.is_mapped && r2_0.mapq >= config.min_mapq;
     
@@ -127,8 +128,8 @@ pub fn process_unc(
     };
     
     // Check integrity
-    let r1_0 = record_to_segkey(r1_records[0]);
-    let r2_0 = record_to_segkey(r2_records[0]);
+    let r1_0 = record_to_segkey(r1_records[0], config);
+    let r2_0 = record_to_segkey(r2_records[0], config);
     
     if category == 0 {
         if r1_0.is_mapped && !check_integrity_1_seg(&s1, config) {
@@ -150,9 +151,9 @@ pub fn process_unc(
             pair_type = "NN";
         }
         let r2_1 = if r2_records.len() > 1 {
-            record_to_segkey(r2_records[1])
+            record_to_segkey(r2_records[1], config)
         } else {
-            record_to_segkey(r2_records[0])
+            record_to_segkey(r2_records[0], config)
         };
         if r2_0.is_mapped && r2_1.is_mapped && !check_integrity_2_seg(&s2, &s3, config) {
             stats.low_map += 1;
@@ -168,9 +169,9 @@ pub fn process_unc(
     } else {
         // category == 2
         let r1_1 = if r1_records.len() > 1 {
-            record_to_segkey(r1_records[1])
+            record_to_segkey(r1_records[1], config)
         } else {
-            record_to_segkey(r1_records[0])
+            record_to_segkey(r1_records[0], config)
         };
         if r1_0.is_mapped && r1_1.is_mapped && !check_integrity_2_seg(&s1, &s2, config) {
             stats.low_map += 1;
@@ -266,6 +267,50 @@ pub fn process_unc(
             (chr2, pos2, strand2, start2, end2, chr1, pos1, strand1, start1, end1, q2, q1)
         };
     
+    // Classify HiC interaction if fragment map is available
+    let hic_type = if let Some(ref frag_map) = config.fragment_map {
+        // Calculate middle position for fragment query (matching HiC-Pro behavior)
+        let middle_pos1 = (final_start1 + final_end1) / 2;
+        let middle_pos2 = (final_start2 + final_end2) / 2;
+        
+        let frag1 = if final_chr1 != "!" {
+            frag_map.query_fragment(&final_chr1, middle_pos1)
+        } else {
+            None
+        };
+        let frag2 = if final_chr2 != "!" {
+            frag_map.query_fragment(&final_chr2, middle_pos2)
+        } else {
+            None
+        };
+        
+        let is_mapped1 = final_chr1 != "!";
+        let is_mapped2 = final_chr2 != "!";
+        
+        let r1_info = HicReadInfo {
+            chr: final_chr1.clone(),
+            pos: final_pos1,
+            strand: final_strand1,
+            is_mapped: is_mapped1,
+        };
+        let r2_info = HicReadInfo {
+            chr: final_chr2.clone(),
+            pos: final_pos2,
+            strand: final_strand2,
+            is_mapped: is_mapped2,
+        };
+        
+        Some(classify_interaction(
+            &r1_info,
+            &r2_info,
+            frag1.as_ref(),
+            frag2.as_ref(),
+            config.min_cis_dist,
+        ).as_str().to_string())
+    } else {
+        None
+    };
+    
     Some(PairOutput {
         read_id,
         chr1: final_chr1,
@@ -283,17 +328,18 @@ pub fn process_unc(
         start2: final_start2,
         end2: final_end2,
         extra_tag,
+        hic_type,
     })
 }
 
-fn record_to_segkey(record: &RecordBuf) -> SegKey {
+fn record_to_segkey(record: &RecordBuf, config: &Config) -> SegKey {
     let flags = record.flags();
     let mapq = record.mapping_quality().map(|q| q.get()).unwrap_or(0);
     let is_mapped = !flags.is_unmapped()
         && record.reference_sequence_id().is_some()
         && !record.cigar().as_ref().is_empty();
     let chr = if is_mapped {
-        format!("{}", record.reference_sequence_id().unwrap())
+        config.get_chrom_name(record.reference_sequence_id())
     } else {
         "!".to_string()
     };
@@ -397,6 +443,7 @@ fn create_fallback_pair(
         start2: 0,
         end2: 0,
         extra_tag,
+        hic_type: None, // Fallback pairs don't have fragment information
     })
 }
 
@@ -408,12 +455,12 @@ fn resolve_category_0(
     r2_records: &[&RecordBuf],
     s1: &Segment,
     s2: &Segment,
-    _config: &Config,
+    config: &Config,
     _stats: &mut Statistics,
     _pair_type: &mut &str,
 ) -> ResolveResult {
-    let r1_0 = record_to_segkey(r1_records[0]);
-    let r2_0 = record_to_segkey(r2_records[0]);
+    let r1_0 = record_to_segkey(r1_records[0], config);
+    let r2_0 = record_to_segkey(r2_records[0], config);
     let strand1 = r1_0.strand;
     let strand2 = r2_0.strand;
     let chr1 = r1_0.chr.clone();
@@ -455,12 +502,12 @@ fn resolve_category_1(
     stats: &mut Statistics,
     pair_type: &mut &str,
 ) -> ResolveResult {
-    let r1_0 = record_to_segkey(r1_records[0]);
-    let r2_0 = record_to_segkey(r2_records[0]);
+    let r1_0 = record_to_segkey(r1_records[0], config);
+    let r2_0 = record_to_segkey(r2_records[0], config);
     let r2_1 = if r2_records.len() > 1 {
-        record_to_segkey(r2_records[1])
+        record_to_segkey(r2_records[1], config)
     } else {
-        record_to_segkey(r2_records[0])
+        record_to_segkey(r2_records[0], config)
     };
     let strand1 = r1_0.strand;
     let chr1 = r1_0.chr.clone();
@@ -543,13 +590,13 @@ fn resolve_category_2(
     stats: &mut Statistics,
     pair_type: &mut &str,
 ) -> ResolveResult {
-    let r1_0 = record_to_segkey(r1_records[0]);
+    let r1_0 = record_to_segkey(r1_records[0], config);
     let r1_1 = if r1_records.len() > 1 {
-        record_to_segkey(r1_records[1])
+        record_to_segkey(r1_records[1], config)
     } else {
-        record_to_segkey(r1_records[0])
+        record_to_segkey(r1_records[0], config)
     };
-    let r2_0 = record_to_segkey(r2_records[0]);
+    let r2_0 = record_to_segkey(r2_records[0], config);
     let strand2 = r2_0.strand;
     let chr2 = r2_0.chr.clone();
     

@@ -1,5 +1,6 @@
 use crate::cigar::cigar_to_segment;
 use crate::config::Config;
+use crate::hic_classifier::{classify_interaction, ReadInfo as HicReadInfo};
 use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
 use crate::segment::{Segment, Statistics};
 use noodles::sam::alignment::record::data::field::Tag;
@@ -25,10 +26,11 @@ pub struct PairOutput {
     pub start2: usize,
     pub end2: usize,
     pub extra_tag: Option<String>,
+    pub hic_type: Option<String>, // HiC interaction type (VI, DE, RE, SC, etc.)
 }
 
 impl PairOutput {
-    pub fn to_string(&self, show_read_coords: bool, _extra_tag_name: Option<&str>) -> String {
+    pub fn to_string(&self, show_read_coords: bool, _extra_tag_name: Option<&str>, include_hic_type: bool) -> String {
         let basic = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.read_id,
@@ -47,9 +49,8 @@ impl PairOutput {
         
         if show_read_coords {
             result = format!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 result,
-                self.rg.as_deref().unwrap_or("."),
                 self.start1,
                 self.end1,
                 self.start2,
@@ -59,6 +60,11 @@ impl PairOutput {
         
         if let Some(tag_val) = &self.extra_tag {
             result = format!("{}\t{}", result, tag_val);
+        }
+        
+        if include_hic_type {
+            let hic_type_str = self.hic_type.as_deref().unwrap_or("*");
+            result = format!("{}\t{}", result, hic_type_str);
         }
         
         result
@@ -146,14 +152,7 @@ fn process_single_record(
         && !record.cigar().as_ref().is_empty();
     
     let chr1 = if is_mapped {
-        String::from_utf8_lossy(
-            record
-                .reference_sequence_id()
-                .and_then(|id| Some(format!("{}", id)))
-                .unwrap_or_default()
-                .as_bytes(),
-        )
-        .to_string()
+        config.get_chrom_name(record.reference_sequence_id())
     } else {
         "!".to_string()
     };
@@ -218,6 +217,55 @@ fn process_single_record(
     let (start2, end2) = (start1, end1);
     let extra_tag = get_tag_value(record, &config.extract_tag);
     
+    // Classify HiC interaction if fragment map is available
+    let hic_type = if let Some(ref frag_map) = config.fragment_map {
+        // Calculate middle position for fragment query (matching HiC-Pro behavior)
+        let middle_pos1 = if is_mapped && segment.seg_cnt > 0 {
+            (start1 + end1) / 2
+        } else {
+            pos1
+        };
+        let middle_pos2 = if is_mapped && segment.seg_cnt > 0 {
+            (start2 + end2) / 2
+        } else {
+            pos2
+        };
+        
+        let frag1 = if is_mapped && chr1 != "!" {
+            frag_map.query_fragment(&chr1, middle_pos1)
+        } else {
+            None
+        };
+        let frag2 = if is_mapped && chr1 != "!" {
+            frag_map.query_fragment(&chr1, middle_pos2)
+        } else {
+            None
+        };
+        
+        let r1_info = HicReadInfo {
+            chr: chr1.clone(),
+            pos: pos1,
+            strand: '+',
+            is_mapped,
+        };
+        let r2_info = HicReadInfo {
+            chr: chr1.clone(),
+            pos: pos2,
+            strand: '-',
+            is_mapped,
+        };
+        
+        Some(classify_interaction(
+            &r1_info,
+            &r2_info,
+            frag1.as_ref(),
+            frag2.as_ref(),
+            config.min_cis_dist,
+        ).as_str().to_string())
+    } else {
+        None
+    };
+    
     Some(PairOutput {
         read_id,
         chr1: chr1.clone(),
@@ -235,6 +283,7 @@ fn process_single_record(
         start2,
         end2,
         extra_tag,
+        hic_type,
     })
 }
 
@@ -254,7 +303,7 @@ fn process_two_records(
         && !record1.cigar().as_ref().is_empty();
     
     let chr1 = if is_mapped1 {
-        format!("{}", record1.reference_sequence_id().unwrap())
+        config.get_chrom_name(record1.reference_sequence_id())
     } else {
         "!".to_string()
     };
@@ -279,7 +328,7 @@ fn process_two_records(
         && !record2.cigar().as_ref().is_empty();
     
     let chr2 = if is_mapped2 {
-        format!("{}", record2.reference_sequence_id().unwrap())
+        config.get_chrom_name(record2.reference_sequence_id())
     } else {
         "!".to_string()
     };
@@ -396,6 +445,47 @@ fn process_two_records(
         return None;
     }
     
+    // Classify HiC interaction if fragment map is available
+    let hic_type = if let Some(ref frag_map) = config.fragment_map {
+        // Calculate middle position for fragment query (matching HiC-Pro behavior)
+        let middle_pos1 = (final_start1 + final_end1) / 2;
+        let middle_pos2 = (final_start2 + final_end2) / 2;
+        
+        let frag1 = if final_chr1 != "!" {
+            frag_map.query_fragment(&final_chr1, middle_pos1)
+        } else {
+            None
+        };
+        let frag2 = if final_chr2 != "!" {
+            frag_map.query_fragment(&final_chr2, middle_pos2)
+        } else {
+            None
+        };
+        
+        let r1_info = HicReadInfo {
+            chr: final_chr1.clone(),
+            pos: final_pos1,
+            strand: final_strand1,
+            is_mapped: is_mapped1,
+        };
+        let r2_info = HicReadInfo {
+            chr: final_chr2.clone(),
+            pos: final_pos2,
+            strand: final_strand2,
+            is_mapped: is_mapped2,
+        };
+        
+        Some(classify_interaction(
+            &r1_info,
+            &r2_info,
+            frag1.as_ref(),
+            frag2.as_ref(),
+            config.min_cis_dist,
+        ).as_str().to_string())
+    } else {
+        None
+    };
+    
     Some(PairOutput {
         read_id,
         chr1: final_chr1,
@@ -413,5 +503,6 @@ fn process_two_records(
         start2: final_start2,
         end2: final_end2,
         extra_tag,
+        hic_type,
     })
 }

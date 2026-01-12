@@ -10,6 +10,7 @@ pub fn write_pairs<P: AsRef<Path>>(
     output_path: P,
     read_coords: bool,
     extra_tag_name: Option<&str>,
+    include_hic_type: bool,
 ) -> Result<(), std::io::Error> {
     let file = File::create(output_path)?;
     let mut writer = BufWriter::new(file);
@@ -18,7 +19,7 @@ pub fn write_pairs<P: AsRef<Path>>(
     let mut header = "#readID\tchr1\tpos1\tchr2\tpos2\tstrand1\tstrand2\tpair_type\tmapq1\tmapq2".to_string();
     
     if read_coords {
-        header.push_str("\tRG\tstart1\tend1\tstart2\tend2");
+        header.push_str("\tstart1\tend1\tstart2\tend2");
     }
     
     if let Some(tag_name) = extra_tag_name {
@@ -26,11 +27,15 @@ pub fn write_pairs<P: AsRef<Path>>(
         header.push_str(tag_name);
     }
     
+    if include_hic_type {
+        header.push_str("\thic_type");
+    }
+    
     writeln!(writer, "{}", header)?;
     
     // Write pairs
     for pair in pairs {
-        writeln!(writer, "{}", pair.to_string(read_coords, extra_tag_name))?;
+        writeln!(writer, "{}", pair.to_string(read_coords, extra_tag_name, include_hic_type))?;
     }
     
     writer.flush()?;
@@ -60,6 +65,20 @@ pub fn write_log<P: AsRef<Path>>(
     writeln!(writer, "pairTypeMM\t{}", stats.pair_type_mm)?;
     writeln!(writer, "pairTypeUR\t{}", stats.pair_type_ur)?;
     writeln!(writer, "pairTypeSC\t{}", stats.pair_type_sc)?;
+    
+    // HiC interaction type statistics (only if any HiC classification was done)
+    if stats.hic_valid > 0 || stats.hic_dangling_end > 0 || stats.hic_religation > 0 
+        || stats.hic_self_circle_frag > 0 || stats.hic_single > 0 
+        || stats.hic_filtered > 0 || stats.hic_dumped > 0 {
+        writeln!(writer, "## HiC Interaction Classification")?;
+        writeln!(writer, "hicValid\t{}", stats.hic_valid)?;
+        writeln!(writer, "hicDanglingEnd\t{}", stats.hic_dangling_end)?;
+        writeln!(writer, "hicReligation\t{}", stats.hic_religation)?;
+        writeln!(writer, "hicSelfCircleFrag\t{}", stats.hic_self_circle_frag)?;
+        writeln!(writer, "hicSingle\t{}", stats.hic_single)?;
+        writeln!(writer, "hicFiltered\t{}", stats.hic_filtered)?;
+        writeln!(writer, "hicDumped\t{}", stats.hic_dumped)?;
+    }
     
     writer.flush()?;
     Ok(())

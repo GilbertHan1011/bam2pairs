@@ -67,6 +67,14 @@ pub struct Statistics {
     pub pair_type_mm: u64,
     pub pair_type_ur: u64,
     pub pair_type_sc: u64,
+    // HiC interaction type counters
+    pub hic_valid: u64,
+    pub hic_dangling_end: u64,
+    pub hic_religation: u64,
+    pub hic_self_circle_frag: u64,
+    pub hic_single: u64,
+    pub hic_filtered: u64,
+    pub hic_dumped: u64,
 }
 
 impl Statistics {
@@ -92,6 +100,14 @@ impl Statistics {
         self.pair_type_mm += other.pair_type_mm;
         self.pair_type_ur += other.pair_type_ur;
         self.pair_type_sc += other.pair_type_sc;
+        // HiC counters
+        self.hic_valid += other.hic_valid;
+        self.hic_dangling_end += other.hic_dangling_end;
+        self.hic_religation += other.hic_religation;
+        self.hic_self_circle_frag += other.hic_self_circle_frag;
+        self.hic_single += other.hic_single;
+        self.hic_filtered += other.hic_filtered;
+        self.hic_dumped += other.hic_dumped;
     }
 
     /// Calculate average MapQ
