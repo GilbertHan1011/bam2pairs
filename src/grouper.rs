@@ -43,10 +43,10 @@ impl<R: BufRead> ReadGrouper<R> {
                 Ok(_) => {
                     let current_name = record.name().map(|n| n.to_vec());
                     
-                    // Skip secondary alignments
-                    if record.flags().is_secondary() {
-                        continue;
-                    }
+                    // Note: We keep secondary alignments for Hi-C processing
+                    // Secondary alignments represent alternative alignments that are
+                    // needed for mate determination in category 1 (1+2) and category 2 (2+1) cases
+                    // The fragment-based mate determination logic will select the best pair
                     
                     match (&self.last_name, &current_name) {
                         (Some(last), Some(curr)) if last == curr => {
