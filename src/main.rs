@@ -11,14 +11,16 @@ mod unc;
 
 use clap::Parser;
 use config::Config;
-use grouper::collect_groups;
+use flash::PairOutput;
+use grouper::ReadGrouper;
 use rayon::prelude::*;
 use segment::Statistics;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use noodles::sam::alignment::RecordBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "bam2pairs")]
@@ -105,11 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bam_reader = noodles::bam::io::Reader::new(reader);
 
     // Read header
-    let header = bam_reader.read_header()?;
+    let sam_header = bam_reader.read_header()?;
 
     // Build reference sequence ID to chromosome name mapping
     let mut ref_seq_map = HashMap::new();
-    for (idx, (name, _)) in header.reference_sequences().iter().enumerate() {
+    for (idx, (name, _)) in sam_header.reference_sequences().iter().enumerate() {
         if let Ok(name_str) = std::str::from_utf8(name.as_ref()) {
             ref_seq_map.insert(idx, name_str.to_string());
         }
@@ -144,49 +146,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("INFO: Grouping reads by name...");
-    let groups = collect_groups(bam_reader, header);
-    eprintln!("INFO: Found {} read groups", groups.len());
+    eprintln!("INFO: Grouping reads by name (streaming)...");
+    let mut grouper = ReadGrouper::new(bam_reader, sam_header);
 
-    // Process groups in parallel
-    eprintln!("INFO: Processing pairs...");
-    let pairs_mutex = Mutex::new(Vec::new());
-    let stats_mutex = Mutex::new(Statistics::new());
-
-    groups.par_iter().for_each(|group| {
-        let mut local_stats = Statistics::new();
-        
-        let pair_result = match args.mode.as_str() {
-            "flash" => flash::process_flash(group, &config, &mut local_stats),
-            "unc" => unc::process_unc(group, &config, &mut local_stats),
-            _ => None,
-        };
-
-        // Collect pair if generated
-        if let Some(pair) = pair_result {
-            pairs_mutex.lock().unwrap().push(pair);
-        }
-
-        // Merge statistics
-        stats_mutex.lock().unwrap().merge(&local_stats);
-    });
-
-    // Extract results
-    let pairs = pairs_mutex.into_inner().unwrap();
-    let stats = stats_mutex.into_inner().unwrap();
-
-    eprintln!("INFO: Processed {} valid pairs", stats.valid_pairs);
-
-    // Write output files
+    // Prepare output writer with header
     let pairs_file = format!("{}.{}.pairs", args.output.display(), args.mode);
     eprintln!("INFO: Writing pairs to {}", pairs_file);
-    output::write_pairs(
-        &pairs,
-        &pairs_file,
-        args.read_coords,
-        config.extract_tag.as_deref(),
-        config.fragment_map.is_some(),
-    )?;
+    let pairs_fh = File::create(&pairs_file)?;
+    let mut pairs_writer = BufWriter::new(pairs_fh);
+
+    let mut header_line = "#readID\tchr1\tpos1\tchr2\tpos2\tstrand1\tstrand2\tpair_type\tmapq1\tmapq2".to_string();
+    if args.read_coords {
+        header_line.push_str("\tstart1\tend1\tstart2\tend2");
+    }
+    if let Some(tag_name) = config.extract_tag.as_deref() {
+        header_line.push_str("\t");
+        header_line.push_str(tag_name);
+    }
+    if config.fragment_map.is_some() {
+        header_line.push_str("\thic_type");
+    }
+    writeln!(pairs_writer, "{}", header_line)?;
+
+    // Streaming processing with chunked parallelism
+    eprintln!("INFO: Processing pairs in streaming mode...");
+    let mut stats = Statistics::new();
+    let chunk_size: usize = 10_000;
+    let mut chunk: Vec<Vec<RecordBuf>> = Vec::with_capacity(chunk_size);
+    let include_hic_type = config.fragment_map.is_some();
+
+    while let Some(group) = grouper.next_group() {
+        chunk.push(group);
+
+        if chunk.len() >= chunk_size {
+            let (pairs, chunk_stats) =
+                process_chunk_parallel(&chunk, &config, args.mode.as_str(), include_hic_type);
+            stats.merge(&chunk_stats);
+
+            for pair in pairs {
+                writeln!(
+                    pairs_writer,
+                    "{}",
+                    pair.to_string(args.read_coords, config.extract_tag.as_deref(), include_hic_type)
+                )?;
+            }
+
+            chunk.clear();
+        }
+    }
+
+    // Process any remaining groups
+    if !chunk.is_empty() {
+        let (pairs, chunk_stats) =
+            process_chunk_parallel(&chunk, &config, args.mode.as_str(), include_hic_type);
+        stats.merge(&chunk_stats);
+
+        for pair in pairs {
+            writeln!(
+                pairs_writer,
+                "{}",
+                pair.to_string(args.read_coords, config.extract_tag.as_deref(), include_hic_type)
+            )?;
+        }
+    }
+
+    pairs_writer.flush()?;
+
+    eprintln!("INFO: Processed {} valid pairs", stats.valid_pairs);
 
     let log_file = format!("{}.{}2pairs.log", args.output.display(), args.mode);
     eprintln!("INFO: Writing statistics to {}", log_file);
@@ -202,4 +228,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("INFO: Done!");
     Ok(())
+}
+
+fn process_chunk_parallel(
+    chunk: &[Vec<RecordBuf>],
+    config: &Config,
+    mode: &str,
+    include_hic_type: bool,
+) -> (Vec<PairOutput>, Statistics) {
+    let pairs_mutex: Mutex<Vec<PairOutput>> = Mutex::new(Vec::new());
+    let stats_mutex: Mutex<Statistics> = Mutex::new(Statistics::new());
+
+    chunk.par_iter().for_each(|group| {
+        let mut local_stats = Statistics::new();
+
+        let pair_result = match mode {
+            "flash" => crate::flash::process_flash(group, config, &mut local_stats),
+            "unc" => crate::unc::process_unc(group, config, &mut local_stats),
+            _ => None,
+        };
+
+        if let Some(pair) = pair_result {
+            // Only keep pairs; HiC type string is already embedded if enabled
+            pairs_mutex.lock().unwrap().push(pair);
+        }
+
+        stats_mutex.lock().unwrap().merge(&local_stats);
+    });
+
+    let pairs = pairs_mutex.into_inner().unwrap();
+    let stats = stats_mutex.into_inner().unwrap();
+
+    (pairs, stats)
 }

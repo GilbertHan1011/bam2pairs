@@ -4,6 +4,7 @@ use crate::flash::PairOutput;
 use crate::hic_classifier::{classify_interaction, ReadInfo as HicReadInfo};
 use crate::integrity::{check_integrity_1_seg, check_integrity_2_seg};
 use crate::segment::{Segment, SegKey, Statistics};
+use crate::fragment::Fragment;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::RecordBuf;
@@ -190,7 +191,7 @@ pub fn process_unc(
         }
     }
     
-    // Resolve positions based on category
+    // Resolve positions based on category and precompute fragments if available
     let result = match category {
         0 => resolve_category_0(&r1_records, &r2_records, &s1, &s2, config, stats, &mut pair_type),
         1 => resolve_category_1(&r1_records, &r2_records, &s1, &s2, &s3, config, stats, &mut pair_type),
@@ -198,10 +199,11 @@ pub fn process_unc(
         _ => return None,
     };
     
-    let (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2) = match result {
-        Some(r) => r,
-        None => return None,
-    };
+    let (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2, frag1_opt, frag2_opt) =
+        match result {
+            Some(r) => r,
+            None => return None,
+        };
     
     // Calculate pair MapQ
     let pair_mapq = q1.min(q2);
@@ -226,7 +228,7 @@ pub fn process_unc(
     }
     
     // Determine final order and calculate distance
-    let (final_chr1, final_pos1, final_strand1, final_start1, final_end1, final_chr2, final_pos2, final_strand2, final_start2, final_end2, final_mapq1, final_mapq2) =
+    let (final_chr1, final_pos1, final_strand1, final_start1, final_end1, final_chr2, final_pos2, final_strand2, final_start2, final_end2, final_mapq1, final_mapq2, final_frag1, final_frag2) =
         if chr1 < chr2 || (chr1 == chr2 && pos1 < pos2) {
             if chr1 == chr2 {
                 let dist = if pos2 > pos1 { pos2 - pos1 } else { 0 };
@@ -245,7 +247,7 @@ pub fn process_unc(
             } else {
                 stats.trans += 1;
             }
-            (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2)
+            (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2, frag1_opt.clone(), frag2_opt.clone())
         } else {
             if chr1 == chr2 {
                 let dist = if pos1 > pos2 { pos1 - pos2 } else { 0 };
@@ -264,26 +266,11 @@ pub fn process_unc(
             } else {
                 stats.trans += 1;
             }
-            (chr2, pos2, strand2, start2, end2, chr1, pos1, strand1, start1, end1, q2, q1)
+            (chr2, pos2, strand2, start2, end2, chr1, pos1, strand1, start1, end1, q2, q1, frag2_opt.clone(), frag1_opt.clone())
         };
     
     // Classify HiC interaction if fragment map is available
     let hic_type = if let Some(ref frag_map) = config.fragment_map {
-        // Calculate middle position for fragment query (matching HiC-Pro behavior)
-        let middle_pos1 = (final_start1 + final_end1) / 2;
-        let middle_pos2 = (final_start2 + final_end2) / 2;
-        
-        let frag1 = if final_chr1 != "!" {
-            frag_map.query_fragment(&final_chr1, middle_pos1)
-        } else {
-            None
-        };
-        let frag2 = if final_chr2 != "!" {
-            frag_map.query_fragment(&final_chr2, middle_pos2)
-        } else {
-            None
-        };
-        
         let is_mapped1 = final_chr1 != "!";
         let is_mapped2 = final_chr2 != "!";
         
@@ -303,8 +290,8 @@ pub fn process_unc(
         Some(classify_interaction(
             &r1_info,
             &r2_info,
-            frag1.as_ref(),
-            frag2.as_ref(),
+            final_frag1.as_ref(),
+            final_frag2.as_ref(),
             config.min_cis_dist,
         ).as_str().to_string())
     } else {
@@ -447,8 +434,24 @@ fn create_fallback_pair(
     })
 }
 
-// Updated return type: (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2)
-type ResolveResult = Option<(String, usize, char, usize, usize, String, usize, char, usize, usize, u8, u8)>;
+// Updated return type:
+// (chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, q2, frag1, frag2)
+type ResolveResult = Option<(
+    String,
+    usize,
+    char,
+    usize,
+    usize,
+    String,
+    usize,
+    char,
+    usize,
+    usize,
+    u8,
+    u8,
+    Option<Fragment>,
+    Option<Fragment>,
+)>;
 
 fn resolve_category_0(
     r1_records: &[&RecordBuf],
@@ -488,8 +491,32 @@ fn resolve_category_0(
     
     let (start1, end1) = s1.span();
     let (start2, end2) = s2.span();
+
+    // Precompute fragments if fragment map is available
+    let (frag1, frag2) = if config.fragment_map.is_some() {
+        let f1 = get_fragment(config, &r1_0, s1);
+        let f2 = get_fragment(config, &r2_0, s2);
+        (f1, f2)
+    } else {
+        (None, None)
+    };
     
-    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq))
+    Some((
+        chr1,
+        pos1,
+        strand1,
+        start1,
+        end1,
+        chr2,
+        pos2,
+        strand2,
+        start2,
+        end2,
+        r1_0.mapq,
+        r2_0.mapq,
+        frag1,
+        frag2,
+    ))
 }
 
 fn resolve_category_1(
@@ -523,9 +550,20 @@ fn resolve_category_1(
     };
     
     let (start1, end1) = s1.span();
+
+    // Precompute fragments if fragment map is available
+    let (f1, f2, f3) = if config.fragment_map.is_some() {
+        (
+            get_fragment(config, &r1_0, s1),
+            get_fragment(config, &r2_0, s2),
+            get_fragment(config, &r2_1, s3),
+        )
+    } else {
+        (None, None, None)
+    };
     
-    // Try to pair s1 with s2 or s3
-    let mate = determine_mate_1_2(&r1_0, &r2_0, &r2_1, s1, s2, s3, config);
+    // Try to pair s1 with s2 or s3 using updated logic
+    let mate = determine_mate_1_2(&r1_0, &r2_0, &r2_1, s1, s2, s3, &f1, &f2, &f3, config);
     
     if mate == 0 {
         stats.unpaired += 1;
@@ -545,12 +583,31 @@ fn resolve_category_1(
             r2_0.pos
         };
         let (start2, end2) = s2.span();
+
+        // Use fragments corresponding to s1 and s2
+        let frag1 = f1.clone();
+        let frag2 = f2.clone();
         
-        return Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq));
+        return Some((
+            chr1,
+            pos1,
+            strand1,
+            start1,
+            end1,
+            chr2,
+            pos2,
+            strand2,
+            start2,
+            end2,
+            r1_0.mapq,
+            r2_0.mapq,
+            frag1,
+            frag2,
+        ));
     }
     
-    let (chr2, pos2, strand2, start2, end2, q2) = if mate == 2 {
-        // s1 paired with s2, extract from s3
+    let (chr2, pos2, strand2, start2, end2, q2, frag1, frag2) = if mate == 2 {
+        // mate == 2 means s1 and s2 are local; output contact s1-s3
         let chr = r2_1.chr.clone();
         let strand = r2_1.strand;
         let pos = if s3.left_clip > s3.right_clip && s3.right.len() > 0 {
@@ -561,9 +618,11 @@ fn resolve_category_1(
             r2_1.pos
         };
         let (s, e) = s3.span();
-        (chr, pos, strand, s, e, r2_0.mapq)
+
+        // final fragments correspond to s1 and s3
+        (chr, pos, strand, s, e, r2_1.mapq, f1.clone(), f3.clone())
     } else {
-        // mate == 3: s1 paired with s3, extract from s2
+        // mate == 3 means s1 and s3 are local; output contact s1-s2
         let chr = r2_0.chr.clone();
         let strand = r2_0.strand;
         let pos = if s2.left_clip > s2.right_clip && s2.right.len() > 0 {
@@ -574,10 +633,27 @@ fn resolve_category_1(
             r2_0.pos
         };
         let (s, e) = s2.span();
-        (chr, pos, strand, s, e, r2_1.mapq)
+
+        // final fragments correspond to s1 and s2
+        (chr, pos, strand, s, e, r2_0.mapq, f1.clone(), f2.clone())
     };
     
-    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, q2))
+    Some((
+        chr1,
+        pos1,
+        strand1,
+        start1,
+        end1,
+        chr2,
+        pos2,
+        strand2,
+        start2,
+        end2,
+        r1_0.mapq,
+        q2,
+        frag1,
+        frag2,
+    ))
 }
 
 fn resolve_category_2(
@@ -611,9 +687,20 @@ fn resolve_category_2(
     };
     
     let (start2, end2) = s3.span();
+
+    // Precompute fragments if fragment map is available
+    let (f1, f2, f3) = if config.fragment_map.is_some() {
+        (
+            get_fragment(config, &r1_0, s1),
+            get_fragment(config, &r1_1, s2),
+            get_fragment(config, &r2_0, s3),
+        )
+    } else {
+        (None, None, None)
+    };
     
-    // Try to pair s3 with s1 or s2
-    let mate = determine_mate_2_1(&r1_0, &r1_1, &r2_0, s1, s2, s3, config);
+    // Try to pair s3 with s1 or s2 using updated logic
+    let mate = determine_mate_2_1(&r1_0, &r1_1, &r2_0, s1, s2, s3, &f1, &f2, &f3, config);
     
     if mate == 0 {
         stats.unpaired += 1;
@@ -633,12 +720,31 @@ fn resolve_category_2(
             r1_0.pos
         };
         let (start1, end1) = s1.span();
+
+        // Use fragments corresponding to s3 and s1
+        let frag1 = f1.clone();
+        let frag2 = f3.clone();
         
-        return Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, r1_0.mapq, r2_0.mapq));
+        return Some((
+            chr1,
+            pos1,
+            strand1,
+            start1,
+            end1,
+            chr2,
+            pos2,
+            strand2,
+            start2,
+            end2,
+            r1_0.mapq,
+            r2_0.mapq,
+            frag1,
+            frag2,
+        ));
     }
     
-    let (chr1, pos1, strand1, start1, end1, q1) = if mate == 1 {
-        // s3 paired with s1, extract from s2
+    let (chr1, pos1, strand1, start1, end1, q1, frag1, frag2) = if mate == 1 {
+        // mate == 1 means s3 and s1 are local; output contact s3-s2
         let chr = r1_1.chr.clone();
         let strand = r1_1.strand;
         let pos = if s2.left_clip > s2.right_clip && s2.right.len() > 0 {
@@ -649,9 +755,11 @@ fn resolve_category_2(
             r1_1.pos
         };
         let (s, e) = s2.span();
-        (chr, pos, strand, s, e, r1_0.mapq)
+
+        // final fragments correspond to s2 and s3
+        (chr, pos, strand, s, e, r1_1.mapq, f2.clone(), f3.clone())
     } else {
-        // mate == 2: s3 paired with s2, extract from s1
+        // mate == 2 means s3 and s2 are local; output contact s3-s1
         let chr = r1_0.chr.clone();
         let strand = r1_0.strand;
         let pos = if s1.left_clip > s1.right_clip && s1.right.len() > 0 {
@@ -662,10 +770,27 @@ fn resolve_category_2(
             r1_0.pos
         };
         let (s, e) = s1.span();
-        (chr, pos, strand, s, e, r1_1.mapq)
+
+        // final fragments correspond to s1 and s3
+        (chr, pos, strand, s, e, r1_0.mapq, f1.clone(), f3.clone())
     };
     
-    Some((chr1, pos1, strand1, start1, end1, chr2, pos2, strand2, start2, end2, q1, r2_0.mapq))
+    Some((
+        chr1,
+        pos1,
+        strand1,
+        start1,
+        end1,
+        chr2,
+        pos2,
+        strand2,
+        start2,
+        end2,
+        q1,
+        r2_0.mapq,
+        frag1,
+        frag2,
+    ))
 }
 
 fn determine_mate_1_2(
@@ -675,57 +800,96 @@ fn determine_mate_1_2(
     s1: &Segment,
     s2: &Segment,
     s3: &Segment,
+    f1: &Option<Fragment>,
+    f2: &Option<Fragment>,
+    f3: &Option<Fragment>,
     config: &Config,
 ) -> usize {
+    // 1. Restriction Fragment Check (Biological Truth)
+    if config.fragment_map.is_some() {
+        // If s1 and s2 are same/adjacent fragment -> s2 is the local mate
+        if are_same_fragment(f1, f2) || are_contiguous(f1, f2) {
+            return 2;
+        }
+        // If s1 and s3 are same/adjacent fragment -> s3 is the local mate
+        if are_same_fragment(f1, f3) || are_contiguous(f1, f3) {
+            return 3;
+        }
+    }
+
+    // 2. Collinearity Check (Physical Geometry Fallback)
     let strand1 = r1_0.strand;
     
-    // Check s1 vs s2
-    if strand1 == '+' {
-        if r2_0.strand == '-'
+    // Check s1 vs s2 (Are they inward facing and close?)
+    let s1_s2_local = if strand1 == '+' {
+        r2_0.strand == '-'
             && r1_0.chr == r2_0.chr
-            && s1.left.len() > 0
-            && s2.left.len() > 0
-            && s1.left[0] < s2.left[0]
-            && s2.right[0].saturating_sub(s1.left[0]) <= config.max_pair_dist
-        {
-            return 2;
-        }
+            && s1.left.first().unwrap_or(&0) < s2.left.first().unwrap_or(&0)
+            && s2
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s1.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
     } else {
-        if r2_0.strand == '+'
+        r2_0.strand == '+'
             && r1_0.chr == r2_0.chr
-            && s2.left.len() > 0
-            && s1.left.len() > 0
-            && s2.left[0] < s1.left[0]
-            && s1.right[0].saturating_sub(s2.left[0]) <= config.max_pair_dist
-        {
-            return 2;
-        }
+            && s2.left.first().unwrap_or(&0) < s1.left.first().unwrap_or(&0)
+            && s1
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s2.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
+    };
+
+    if s1_s2_local {
+        return 2;
     }
-    
+
     // Check s1 vs s3
-    if strand1 == '+' {
-        if r2_1.strand == '-'
+    let s1_s3_local = if strand1 == '+' {
+        r2_1.strand == '-'
             && r1_0.chr == r2_1.chr
-            && s1.left.len() > 0
-            && s3.left.len() > 0
-            && s1.left[0] < s3.left[0]
-            && s3.right[0].saturating_sub(s1.left[0]) <= config.max_pair_dist
-        {
-            return 3;
-        }
+            && s1.left.first().unwrap_or(&0) < s3.left.first().unwrap_or(&0)
+            && s3
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s1.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
     } else {
-        if r2_1.strand == '+'
+        r2_1.strand == '+'
             && r1_0.chr == r2_1.chr
-            && s3.left.len() > 0
-            && s1.left.len() > 0
-            && s3.left[0] < s1.left[0]
-            && s1.right[0].saturating_sub(s3.left[0]) <= config.max_pair_dist
-        {
-            return 3;
-        }
+            && s3.left.first().unwrap_or(&0) < s1.left.first().unwrap_or(&0)
+            && s1
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s3.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
+    };
+
+    if s1_s3_local {
+        return 3;
     }
+
+    // 3. MapQ Check (Statistical Ambiguity Resolution)
+    // If neither looks like a local pair (Trans-Trans or Long-Range),
+    // we assume the High MapQ alignment is the valid CONTACT,
+    // and the Low MapQ alignment is the noise/artifact.
+    //
+    // Note: 'mate' is the index of the segment we *don't* want in the output pair.
     
-    0
+    if r2_0.mapq >= r2_1.mapq {
+        // s2 is better quality. We want output to be s1-s2.
+        // So we designate s3 as the "mate" (to be hidden/extracted away).
+        3
+    } else {
+        // s3 is better quality. We want output to be s1-s3.
+        // So we designate s2 as the "mate".
+        2
+    }
 }
 
 fn determine_mate_2_1(
@@ -735,55 +899,127 @@ fn determine_mate_2_1(
     s1: &Segment,
     s2: &Segment,
     s3: &Segment,
+    f1: &Option<Fragment>,
+    f2: &Option<Fragment>,
+    f3: &Option<Fragment>,
     config: &Config,
 ) -> usize {
+    // 1. Restriction Fragment Check
+    if config.fragment_map.is_some() {
+        // s3 vs s1
+        if are_same_fragment(f3, f1) || are_contiguous(f3, f1) {
+            return 1;
+        }
+        // s3 vs s2
+        if are_same_fragment(f3, f2) || are_contiguous(f3, f2) {
+            return 2;
+        }
+    }
+
+    // 2. Collinearity Check
     let strand2 = r2_0.strand;
     
     // Check s3 vs s1
-    if strand2 == '+' {
-        if r1_0.strand == '-'
+    let s3_s1_local = if strand2 == '+' {
+        r1_0.strand == '-'
             && r2_0.chr == r1_0.chr
-            && s3.left.len() > 0
-            && s1.left.len() > 0
-            && s3.left[0] < s1.left[0]
-            && s1.right[0].saturating_sub(s3.left[0]) <= config.max_pair_dist
-        {
-            return 1;
-        }
+            && s3.left.first().unwrap_or(&0) < s1.left.first().unwrap_or(&0)
+            && s1
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s3.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
     } else {
-        if r1_0.strand == '+'
+        r1_0.strand == '+'
             && r2_0.chr == r1_0.chr
-            && s1.left.len() > 0
-            && s3.left.len() > 0
-            && s1.left[0] < s3.left[0]
-            && s3.right[0].saturating_sub(s1.left[0]) <= config.max_pair_dist
-        {
-            return 1;
-        }
+            && s1.left.first().unwrap_or(&0) < s3.left.first().unwrap_or(&0)
+            && s3
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s1.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
+    };
+
+    if s3_s1_local {
+        return 1;
     }
-    
+
     // Check s3 vs s2
-    if strand2 == '+' {
-        if r1_1.strand == '-'
+    let s3_s2_local = if strand2 == '+' {
+        r1_1.strand == '-'
             && r2_0.chr == r1_1.chr
-            && s3.left.len() > 0
-            && s2.left.len() > 0
-            && s3.left[0] < s2.left[0]
-            && s2.right[0].saturating_sub(s3.left[0]) <= config.max_pair_dist
-        {
-            return 2;
-        }
+            && s3.left.first().unwrap_or(&0) < s2.left.first().unwrap_or(&0)
+            && s2
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s3.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
     } else {
-        if r1_1.strand == '+'
+        r1_1.strand == '+'
             && r2_0.chr == r1_1.chr
-            && s2.left.len() > 0
-            && s3.left.len() > 0
-            && s2.left[0] < s3.left[0]
-            && s3.right[0].saturating_sub(s2.left[0]) <= config.max_pair_dist
-        {
-            return 2;
-        }
+            && s2.left.first().unwrap_or(&0) < s3.left.first().unwrap_or(&0)
+            && s3
+                .right
+                .first()
+                .unwrap_or(&0)
+                .saturating_sub(*s2.left.first().unwrap_or(&0))
+                <= config.max_pair_dist
+    };
+
+    if s3_s2_local {
+        return 2;
     }
+
+    // 3. MapQ Check
+    // Pick the best quality alignment as the valid contact.
+    if r1_0.mapq >= r1_1.mapq {
+        // s1 is better. Output s3-s1. Hide s2.
+        2
+    } else {
+        // s2 is better. Output s3-s2. Hide s1.
+        1
+    }
+}
+
+// -----------------------------------------------------------
+//  NEW HELPERS FOR FRAGMENT TOPOLOGY
+// -----------------------------------------------------------
+
+fn get_fragment(config: &Config, key: &SegKey, seg: &Segment) -> Option<Fragment> {
+    let frag_map = config.fragment_map.as_ref()?;
     
-    0
+    // Calculate middle pos similar to classification
+    let (start, end) = seg.span();
+    let mid = if start > 0 && end > 0 {
+        (start + end) / 2
+    } else {
+        key.pos
+    };
+    
+    if key.chr == "!" {
+        return None;
+    }
+    frag_map.query_fragment(&key.chr, mid)
+}
+
+fn are_same_fragment(f1: &Option<Fragment>, f2: &Option<Fragment>) -> bool {
+    match (f1, f2) {
+        (Some(a), Some(b)) => a.chr == b.chr && a.start == b.start && a.end == b.end,
+        _ => false,
+    }
+}
+
+fn are_contiguous(f1: &Option<Fragment>, f2: &Option<Fragment>) -> bool {
+    match (f1, f2) {
+        (Some(a), Some(b)) => {
+            if a.chr != b.chr {
+                return false;
+            }
+            a.end == b.start || a.start == b.end
+        }
+        _ => false,
+    }
 }
