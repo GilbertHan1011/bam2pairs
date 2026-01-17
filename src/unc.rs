@@ -809,11 +809,11 @@ fn determine_mate_1_2(
     if config.fragment_map.is_some() {
         // If s1 and s2 are same/adjacent fragment -> s2 is the local mate
         if are_same_fragment(f1, f2) || are_contiguous(f1, f2) {
-            return 2;
+            return 3;
         }
         // If s1 and s3 are same/adjacent fragment -> s3 is the local mate
         if are_same_fragment(f1, f3) || are_contiguous(f1, f3) {
-            return 3;
+            return 2;
         }
     }
 
@@ -908,11 +908,11 @@ fn determine_mate_2_1(
     if config.fragment_map.is_some() {
         // s3 vs s1
         if are_same_fragment(f3, f1) || are_contiguous(f3, f1) {
-            return 1;
+            return 2;
         }
         // s3 vs s2
         if are_same_fragment(f3, f2) || are_contiguous(f3, f2) {
-            return 2;
+            return 1;
         }
     }
 
@@ -943,7 +943,7 @@ fn determine_mate_2_1(
     };
 
     if s3_s1_local {
-        return 1;
+        return 2;
     }
 
     // Check s3 vs s2
@@ -970,7 +970,7 @@ fn determine_mate_2_1(
     };
 
     if s3_s2_local {
-        return 2;
+        return 1;
     }
 
     // 3. MapQ Check
