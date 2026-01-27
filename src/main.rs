@@ -109,6 +109,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read header
     let sam_header = bam_reader.read_header()?;
 
+    // Check BAM sort order: bam2pairs requires queryname-sorted input.
+    //
+    // Note: Many aligners output coordinate-sorted BAM by default; grouping by read name
+    // (and thus correct pairing / multi-hit handling) requires name-sorted BAM.
+    //
+    // The noodles SAM header API in this version does not expose a direct `sort_order`
+    // accessor on the top-level header map, so we conservatively inspect the debug
+    // representation of the header for an SO:coordinate flag.
+    let header_text = format!("{sam_header:?}");
+    if header_text.contains("SO:Coordinate") {
+        eprintln!("\x1b[31mERROR: Input BAM file is coordinate-sorted!\x1b[0m");
+        eprintln!("       bam2pairs requires a name-sorted BAM (QueryName) to correctly group paired-end reads.");
+        eprintln!("       Please run: \x1b[1msamtools sort -n -o <out_name_sorted.bam> <in.bam>\x1b[0m");
+        return Err("Input BAM is coordinate-sorted. Aborting.".into());
+    }
+
     // Build reference sequence ID to chromosome name mapping
     let mut ref_seq_map = HashMap::new();
     for (idx, (name, _)) in sam_header.reference_sequences().iter().enumerate() {
